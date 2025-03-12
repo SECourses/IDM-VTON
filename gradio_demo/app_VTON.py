@@ -635,7 +635,7 @@ with image_blocks as demo:
             with gr.Row():
                 image_gallery = gr.Gallery(label="Generated Images", show_label=True)
             with gr.Row():
-                try_button = gr.Button(value="Try-on")
+                try_button = gr.Button(value="Try-on",variant='primary')
                 denoise_steps = gr.Number(label="Denoising Steps", minimum=20, maximum=120, value=30, step=1)
                 seed = gr.Number(label="Seed", minimum=-1, maximum=2147483647, step=1, value=42)
                 is_randomize_seed = gr.Checkbox(label="Randomize seed for each generated image", value=True)
