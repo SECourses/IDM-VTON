@@ -88,7 +88,6 @@ def torch_gc():
         with torch.cuda.device('cuda'):
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-   
     gc.collect()
 
 def restart_cpu_offload(pipe, load_mode):
@@ -110,9 +109,7 @@ def optionally_disable_offloading(_pipeline):
     """
     is_model_cpu_offload = False
     is_sequential_cpu_offload = False
-    print(
-            fr"Restarting CPU Offloading for pipeline..."
-          )
+    print("Restarting CPU Offloading for pipeline...")
     if _pipeline is not None:
         for _, component in _pipeline.components.items():
             if isinstance(component, torch.nn.Module) and hasattr(component, "_hf_hook"):
@@ -138,8 +135,7 @@ def quantize_4bit(module):
             out_features = child.out_features
             device = child.weight.data.device
 
-            # Create and configure the Linear layer
-            has_bias = True if child.bias is not None else False
+            has_bias = child.bias is not None
             
             # fp16 for compute dtype leads to faster inference
             # and one should almost always use nf4 as a rule of thumb
@@ -156,12 +152,42 @@ def quantize_4bit(module):
 
             new_layer.load_state_dict(child.state_dict())
             new_layer = new_layer.to(device)
-
-            # Set the attribute
             setattr(module, name, new_layer)
         else:
-            # Recursively apply to child modules
             quantize_4bit(child)
+
+def quantize_8bit(module):
+    """
+    Apply 8-bit quantization to model modules using Linear8bitLt.
+    Note: The compute_dtype argument has been removed as it is not accepted.
+    """
+    if not bnb_available:
+        raise ImportError("bitsandbytes is required for 8-bit quantization")
+        
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Linear):
+            in_features = child.in_features
+            out_features = child.out_features
+            device = child.weight.data.device
+
+            has_bias = child.bias is not None
+            quant_type = "int8"
+
+            # Use Linear8bitLt if available; note that compute_dtype is removed.
+            if hasattr(bnb.nn, "Linear8bitLt"):
+                new_layer = bnb.nn.Linear8bitLt(
+                    in_features,
+                    out_features,
+                    bias=has_bias
+                )
+            else:
+                raise AttributeError("bitsandbytes.nn does not have attribute 'Linear8bitLt'. Please ensure you have an updated version of bitsandbytes that supports 8-bit quantization.")
+                
+            new_layer.load_state_dict(child.state_dict())
+            new_layer = new_layer.to(device)
+            setattr(module, name, new_layer)
+        else:
+            quantize_8bit(child)
 
 def pil_to_binary_mask(pil_image, threshold=0):
     """
@@ -173,9 +199,9 @@ def pil_to_binary_mask(pil_image, threshold=0):
     mask = np.zeros(binary_mask.shape, dtype=np.uint8)
     for i in range(binary_mask.shape[0]):
         for j in range(binary_mask.shape[1]):
-            if binary_mask[i,j] == True:
-                mask[i,j] = 1
-    mask = (mask*255).astype(np.uint8)
+            if binary_mask[i, j]:
+                mask[i, j] = 1
+    mask = (mask * 255).astype(np.uint8)
     output_mask = Image.fromarray(mask)
     return output_mask
 
@@ -191,7 +217,6 @@ def save_output_image(image, base_path="outputs", base_filename="img", seed=None
     filename = f"{base_filename}_{timestamp}{seed_str}.png"
     filepath = os.path.join(base_path, filename)
     
-    # Ensure we don't overwrite existing files
     counter = 1
     while os.path.exists(filepath):
         filename = f"{base_filename}_{timestamp}_{counter}{seed_str}.png"
@@ -215,7 +240,6 @@ def open_folder(folder_path="outputs"):
     else:  # Linux
         subprocess.Popen(["xdg-open", folder_path])
 
-# Function for auto-cropping on upload
 def auto_crop_upload(editor_value, crop_flag):
     """
     When a user uploads an image (EditorValue) and if auto-cropping is enabled 
@@ -230,7 +254,6 @@ def auto_crop_upload(editor_value, crop_flag):
     try:
         img = editor_value["background"].convert("RGB")
         if crop_flag:
-            # Save the original image before cropping so that we can use it later for stitching.
             ORIGINAL_IMAGE = img.copy()
             print("auto_crop_upload: Original image stored with resolution:", ORIGINAL_IMAGE.size)
             width, height = img.size
@@ -241,10 +264,8 @@ def auto_crop_upload(editor_value, crop_flag):
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
             cropped_img = img.crop((left, top, right, bottom))
-            # Resize the cropped image to the proper dimensions used by the model (768×1024)
             resized_img = cropped_img.resize((768, 1024))
             editor_value["background"] = resized_img
-            # If there are any drawn layers (mask layers), crop and resize them too.
             if editor_value.get("layers"):
                 new_layers = []
                 for layer in editor_value["layers"]:
@@ -254,7 +275,6 @@ def auto_crop_upload(editor_value, crop_flag):
                     else:
                         new_layers.append(None)
                 editor_value["layers"] = new_layers
-            # Optionally update "composite"
             editor_value["composite"] = resized_img
             editor_value["auto_cropped"] = True
             print("auto_crop_upload: Cropping done. Crop region:", left, top, right, bottom)
@@ -270,7 +290,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
     print(f"start_tryon: Input dict from ImageEditor: {dict}")
 
     if pipe is None:
-        # Lazy loading of models
         unet = UNet2DConditionModel.from_pretrained(
             model_id,
             subfolder="unet",
@@ -279,10 +298,11 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         
         if load_mode == '4bit' and bnb_available:
             quantize_4bit(unet)
+        elif load_mode == '8bit' and bnb_available:
+            quantize_8bit(unet)
 
         unet.requires_grad_(False)
 
-        # Load tokenizers
         tokenizer_one = AutoTokenizer.from_pretrained(
             model_id,
             subfolder="tokenizer",
@@ -297,7 +317,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         )
         noise_scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
-        # Load text encoders
         text_encoder_one = CLIPTextModel.from_pretrained(
             model_id,
             subfolder="text_encoder",
@@ -309,7 +328,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             torch_dtype=torch.float16,
         )
 
-        # Load image encoder
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
             model_id,
             subfolder="image_encoder",
@@ -317,17 +335,17 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         )
         if load_mode == '4bit' and bnb_available:
             quantize_4bit(image_encoder)
+        elif load_mode == '8bit' and bnb_available:
+            quantize_8bit(image_encoder)
 
-        # Load VAE with optimization
         if fixed_vae:
             vae = AutoencoderKL.from_pretrained(vae_model_id, torch_dtype=dtype)
         else:
             vae = AutoencoderKL.from_pretrained(model_id,
-                                            subfolder="vae",
-                                            torch_dtype=dtype,
+                                                subfolder="vae",
+                                                torch_dtype=dtype,
             )
 
-        # Load UNet encoder
         UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
             model_id,
             subfolder="unet_encoder",
@@ -336,8 +354,9 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
 
         if load_mode == '4bit' and bnb_available:
             quantize_4bit(UNet_Encoder)
+        elif load_mode == '8bit' and bnb_available:
+            quantize_8bit(UNet_Encoder)
 
-        # Set requires_grad to False for all models
         UNet_Encoder.requires_grad_(False)
         image_encoder.requires_grad_(False)
         vae.requires_grad_(False)
@@ -345,7 +364,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         text_encoder_one.requires_grad_(False)
         text_encoder_two.requires_grad_(False)
 
-        # Create pipeline
         pipe = TryonPipeline.from_pretrained(
             model_id,
             unet=unet,
@@ -362,7 +380,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         pipe.unet_encoder = UNet_Encoder
         pipe.unet_encoder.to(device)
         
-        # Ensure encoder_hid_proj is on the same device
         if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
             pipe.unet.encoder_hid_proj.to(device)
 
@@ -371,34 +388,33 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                 quantize_4bit(pipe.text_encoder)
             if pipe.text_encoder_2 is not None:
                 quantize_4bit(pipe.text_encoder_2)
+        elif load_mode == '8bit' and bnb_available:
+            if pipe.text_encoder is not None:
+                quantize_8bit(pipe.text_encoder)
+            if pipe.text_encoder_2 is not None:
+                quantize_8bit(pipe.text_encoder_2)
     else:
         if ENABLE_CPU_OFFLOAD:
             need_restart_cpu_offloading = True
 
-    # Garbage collection
     torch_gc()
     
-    # Initialize models
     parsing_model = Parsing(0)
     openpose_model = OpenPose(0)
     openpose_model.preprocessor.body_estimation.model.to(device)
     pipe.to(device)
     pipe.unet_encoder.to(device)
     
-    # Ensure encoder_hid_proj is on the same device
     if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
         pipe.unet.encoder_hid_proj.to(device)
 
-    # Apply CPU offloading if enabled
     if need_restart_cpu_offloading:
         restart_cpu_offload(pipe, load_mode)
     elif ENABLE_CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
-        # Make sure encoder_hid_proj is on the same device as the unet after offloading
         if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
             pipe.unet.encoder_hid_proj.to(pipe.unet.device)
 
-    # Transform setup
     tensor_transfrom = transforms.Compose(
         [
             transforms.ToTensor(),
@@ -406,12 +422,10 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         ]
     )
 
-    # Process input images
     garm_img = garm_img.convert("RGB").resize((768, 1024))
     human_img_orig = dict["background"].convert("RGB")
     print("start_tryon: Received human image from editor.")
 
-    # Handle auto-cropping
     if is_checked_crop:
         if ORIGINAL_IMAGE is not None:
             orig = ORIGINAL_IMAGE
@@ -436,13 +450,11 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         crop_size = (crop_width_final, crop_height_final)
         print(f"start_tryon: Computed crop region on original image: left_orig: {left_orig}, top_orig: {top_orig}, target_width: {target_width}, target_height: {target_height}")
         print(f"start_tryon: Scaled crop region for final image: left_final: {left_final}, top_final: {top_final}, crop_size: {crop_size}")
-        # Use the already auto-cropped human image as model input since it is 768x1024.
         human_img = human_img_orig
     else:
         human_img = human_img_orig.resize((768, 1024))
         print("start_tryon: Auto crop not enabled, resized human image to 768x1024.")
 
-    # Generate mask
     if is_checked:
         keypoints = openpose_model(human_img.resize((384, 512)))
         model_parse, _ = parsing_model(human_img.resize((384, 512)))
@@ -469,11 +481,10 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
 
-    # Generate pose image
     human_img_arg = _apply_exif_orientation(human_img.resize((384, 512)))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
-    args_apply = apply_net.create_argument_parser().parse_args((
+    args_apply = apply_net.create_argument_parser().parse_args(( 
         'show', 
         './configs/densepose_rcnn_R_50_FPN_s1x.yaml', 
         './ckpt/densepose/model_final_162be9.pkl', 
@@ -483,13 +494,11 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
     pose_img = pose_img[:, :, ::-1]
     pose_img = Image.fromarray(pose_img).resize((768, 1024))
 
-    # Ensure text encoders are on the correct device
     if pipe.text_encoder is not None:
         pipe.text_encoder.to(device)
     if pipe.text_encoder_2 is not None:
         pipe.text_encoder_2.to(device)
 
-    # Run inference with optimizations
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             with torch.no_grad():
@@ -535,7 +544,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                         generator = torch.Generator(device).manual_seed(current_seed) if seed != -1 else None
                         current_seed = current_seed + i
                         
-                        # Ensure all tensors are on the same device before starting
                         if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
                             pipe.unet.encoder_hid_proj.to(pipe.unet.device)
                                 
@@ -559,7 +567,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                         )[0]
                         if is_checked_crop:
                             final_img = final_background.copy()
-                            # Ensure the generated image is resized to the computed crop_size
                             gen_img = images[0].resize(crop_size)
                             final_img.paste(gen_img, (left_final, top_final))
                             print(f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})")
@@ -570,7 +577,6 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             results.append(img_path)
                     return results, mask_gray
 
-# Setup example paths
 garm_list = os.listdir(os.path.join(example_path, "cloth"))
 garm_list_path = [os.path.join(example_path, "cloth", garm) for garm in garm_list]
 
@@ -585,10 +591,9 @@ for ex_human in human_list_path:
     ex_dict['composite'] = None
     human_ex_list.append(ex_dict)
 
-# Create Gradio interface
 image_blocks = gr.Blocks().queue()
 with image_blocks as demo:
-    gr.Markdown("## IDM-VTON 👕👔👚 with VRAM Optimizations")
+    gr.Markdown("## SECourses IDM VTON V18 : https://www.patreon.com/posts/122718239")
     gr.Markdown("Virtual Try-on with your image and garment image. Check out the [source codes](https://github.com/yisol/IDM-VTON) and the [model](https://huggingface.co/yisol/IDM-VTON)")
     with gr.Row():
         with gr.Column():
@@ -599,7 +604,6 @@ with image_blocks as demo:
                 interactive=True,
                 height=550
             )
-            # Attach auto-crop event
             imgs.upload(auto_crop_upload, inputs=[imgs, gr.Checkbox(value=True, label="Use auto-crop & resizing")], outputs=imgs)
             with gr.Row():
                 category = gr.Radio(choices=["upper_body", "lower_body", "dresses"], label="Select Garment Category", value="upper_body")
@@ -644,5 +648,4 @@ with image_blocks as demo:
         api_name='tryon'
     )
 
-# Launch the app
 image_blocks.launch(inbrowser=True, share=args.share)
