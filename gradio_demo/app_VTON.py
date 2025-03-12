@@ -28,6 +28,17 @@ from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_or
 from torchvision.transforms.functional import to_pil_image
 import gc
 import sys
+import datetime
+import platform
+import subprocess
+
+# Import bitsandbytes early for all quantization options
+try:
+    import bitsandbytes as bnb
+    from accelerate.hooks import AlignDevicesHook, CpuOffload, remove_hook_from_module
+    bnb_available = True
+except ImportError:
+    bnb_available = False
 
 # Global variable to store the original uploaded image (full resolution)
 ORIGINAL_IMAGE = None
@@ -50,8 +61,12 @@ vae_model_id = 'madebyollin/sdxl-vae-fp16-fix'
 
 dtypeQuantize = dtype
 
-if load_mode in ('4bit','8bit'):
-    dtypeQuantize = torch.float8_e4m3fn
+if load_mode == '8bit':
+    dtypeQuantize = torch.float16  # Use fp16 instead of fp8 for 8-bit mode
+elif load_mode == '4bit':
+    if not bnb_available:
+        raise ImportError("bitsandbytes is required for 4-bit quantization. Please install it with: pip install bitsandbytes")
+    dtypeQuantize = torch.float16  # Use fp16 for computation with 4-bit weights
 
 ENABLE_CPU_OFFLOAD = args.lowvram
 torch.backends.cudnn.allow_tf32 = False
@@ -80,10 +95,14 @@ def restart_cpu_offload(pipe, load_mode):
     """
     Restart CPU offloading for pipeline
     """
-    optionally_disable_offloading(pipe)    
+    is_model_cpu_offload, is_sequential_cpu_offload = optionally_disable_offloading(pipe)
     gc.collect()
     torch.cuda.empty_cache()
-    pipe.enable_model_cpu_offload()    
+    pipe.enable_model_cpu_offload()
+    
+    # Make sure encoder_hid_proj is on the same device as the unet
+    if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
+        pipe.unet.encoder_hid_proj.to(pipe.unet.device)
 
 def optionally_disable_offloading(_pipeline):
     """
@@ -110,6 +129,9 @@ def quantize_4bit(module):
     """
     Apply 4-bit quantization to model modules
     """
+    if not bnb_available:
+        raise ImportError("bitsandbytes is required for 4-bit quantization")
+        
     for name, child in module.named_children():
         if isinstance(child, torch.nn.Linear):
             in_features = child.in_features
@@ -249,17 +271,13 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
 
     if pipe is None:
         # Lazy loading of models
-        if load_mode == '4bit':
-            # Import bitsandbytes only when needed
-            import bitsandbytes as bnb
-            from accelerate.hooks import AlignDevicesHook, CpuOffload, remove_hook_from_module
-
         unet = UNet2DConditionModel.from_pretrained(
             model_id,
             subfolder="unet",
             torch_dtype=dtypeQuantize,
         )
-        if load_mode == '4bit':
+        
+        if load_mode == '4bit' and bnb_available:
             quantize_4bit(unet)
 
         unet.requires_grad_(False)
@@ -297,7 +315,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             subfolder="image_encoder",
             torch_dtype=torch.float16,
         )
-        if load_mode == '4bit':
+        if load_mode == '4bit' and bnb_available:
             quantize_4bit(image_encoder)
 
         # Load VAE with optimization
@@ -316,7 +334,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             torch_dtype=dtypeQuantize,
         )
 
-        if load_mode == '4bit':
+        if load_mode == '4bit' and bnb_available:
             quantize_4bit(UNet_Encoder)
 
         # Set requires_grad to False for all models
@@ -343,8 +361,12 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         )
         pipe.unet_encoder = UNet_Encoder
         pipe.unet_encoder.to(device)
+        
+        # Ensure encoder_hid_proj is on the same device
+        if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
+            pipe.unet.encoder_hid_proj.to(device)
 
-        if load_mode == '4bit':
+        if load_mode == '4bit' and bnb_available:
             if pipe.text_encoder is not None:
                 quantize_4bit(pipe.text_encoder)
             if pipe.text_encoder_2 is not None:
@@ -362,12 +384,19 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
     openpose_model.preprocessor.body_estimation.model.to(device)
     pipe.to(device)
     pipe.unet_encoder.to(device)
+    
+    # Ensure encoder_hid_proj is on the same device
+    if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
+        pipe.unet.encoder_hid_proj.to(device)
 
     # Apply CPU offloading if enabled
     if need_restart_cpu_offloading:
         restart_cpu_offload(pipe, load_mode)
     elif ENABLE_CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
+        # Make sure encoder_hid_proj is on the same device as the unet after offloading
+        if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
+            pipe.unet.encoder_hid_proj.to(pipe.unet.device)
 
     # Transform setup
     tensor_transfrom = transforms.Compose(
@@ -505,6 +534,11 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             current_seed = torch.randint(0, 2**32, size=(1,)).item()
                         generator = torch.Generator(device).manual_seed(current_seed) if seed != -1 else None
                         current_seed = current_seed + i
+                        
+                        # Ensure all tensors are on the same device before starting
+                        if hasattr(pipe.unet, 'encoder_hid_proj') and pipe.unet.encoder_hid_proj is not None:
+                            pipe.unet.encoder_hid_proj.to(pipe.unet.device)
+                                
                         images = pipe(
                             prompt_embeds=prompt_embeds.to(device, dtype),
                             negative_prompt_embeds=negative_prompt_embeds.to(device, dtype),
@@ -609,11 +643,6 @@ with image_blocks as demo:
         outputs=[image_gallery, masked_img],
         api_name='tryon'
     )
-
-# Fix missing imports for save_output_image
-import datetime
-import platform
-import subprocess
 
 # Launch the app
 image_blocks.launch(inbrowser=True, share=args.share)

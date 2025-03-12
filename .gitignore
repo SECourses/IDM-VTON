@@ -1,0 +1,10 @@
+ckpt
+gradio_demo/__pycache__/
+gradio_demo/densepose
+gradio_demo/detectron2
+ip_adapter
+outputs
+preprocess
+src
+venv
+ckpt/densepose/model_final_162be9.pkl
