@@ -287,6 +287,9 @@ def auto_crop_upload(editor_value, crop_flag):
 def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed, seed, number_of_images):
     global pipe, unet, UNet_Encoder, need_restart_cpu_offloading, ORIGINAL_IMAGE
 
+    if garm_img is None:
+        raise gr.Error("Please upload a garment image.")
+
     print(f"start_tryon: Input dict from ImageEditor: {dict}")
 
     if pipe is None:
@@ -593,7 +596,7 @@ for ex_human in human_list_path:
 
 image_blocks = gr.Blocks().queue()
 with image_blocks as demo:
-    gr.Markdown("## SECourses IDM VTON V18 : https://www.patreon.com/posts/122718239")
+    gr.Markdown("## SECourses IDM VTON V19 : https://www.patreon.com/posts/122718239")
     gr.Markdown("Virtual Try-on with your image and garment image. Check out the [source codes](https://github.com/yisol/IDM-VTON) and the [model](https://huggingface.co/yisol/IDM-VTON)")
     with gr.Row():
         with gr.Column():
